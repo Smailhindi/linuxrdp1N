@@ -1,114 +1,186 @@
-name: RDP
+name: Secure Lightweight RDP
 
 on:
   workflow_dispatch:
+    inputs:
+      session_minutes:
+        description: 'Session duration (minutes)'
+        required: true
+        type: choice
+        default: '180'
+        options:
+          - '60'
+          - '120'
+          - '180'
+          - '300'
+      lite_mode:
+        description: 'Light graphics / lower bandwidth'
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: secure-rdp-${{ github.repository }}
+  cancel-in-progress: true
 
 jobs:
-  secure-rdp:
+  rdp:
     runs-on: windows-latest
-    timeout-minutes: 3600
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: pwsh
 
     steps:
-      - name: Configure Core RDP Settings
+      - name: Check required secrets
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          # Enable Remote Desktop and disable Network Level Authentication (if needed)
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+            throw 'Missing GitHub secret: TAILSCALE_AUTH_KEY'
+          }
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw 'Missing GitHub secret: RDP_PASSWORD'
+          }
+          if ($env:RDP_PASSWORD.Length -lt 12) {
+            throw 'RDP_PASSWORD must contain at least 12 characters.'
+          }
 
-          # Remove any existing rule with the same name to avoid duplication
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
-          
-          # For testing, allow any incoming connection on port 3389
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
+      - name: Enable secure RDP and create user
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          LITE_MODE: ${{ inputs.lite_mode }}
+        run: |
+          $ErrorActionPreference = 'Stop'
 
-          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          # Keep Network Level Authentication and TLS enabled.
+          $server = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
+          $tcp = Join-Path $server 'WinStations\RDP-Tcp'
+          Set-ItemProperty -Path $server -Name fDenyTSConnections -Value 0
+          Set-ItemProperty -Path $tcp -Name UserAuthentication -Value 1
+          Set-ItemProperty -Path $tcp -Name SecurityLayer -Value 2
+
+          # Use a password selected by the repository owner.
+          $secure = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          if (Get-LocalUser -Name 'RDP' -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name 'RDP' -Password $secure
+          } else {
+            New-LocalUser -Name 'RDP' -Password $secure -AccountNeverExpires -PasswordNeverExpires | Out-Null
+          }
+          foreach ($group in @('Administrators', 'Remote Desktop Users')) {
+            $members = @(Get-LocalGroupMember -Group $group -ErrorAction SilentlyContinue)
+            if (-not ($members | Where-Object { $_.Name -match '[\\]RDP$' })) {
+              Add-LocalGroupMember -Group $group -Member 'RDP'
+            }
+          }
+
+          # Do not allow the standard broad RDP firewall rules.
+          Get-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue |
+            Disable-NetFirewallRule -ErrorAction SilentlyContinue
+
+          # Optional bandwidth reduction for the remote desktop.
+          if ($env:LITE_MODE -eq 'true') {
+            $policy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+            New-Item -Path $policy -Force | Out-Null
+            New-ItemProperty -Path $policy -Name fNoRemoteDesktopWallpaper `
+              -PropertyType DWord -Value 1 -Force | Out-Null
+          }
+
+          Set-Service -Name TermService -StartupType Automatic
           Restart-Service -Name TermService -Force
+          Write-Host 'Secure RDP is configured (NLA and TLS enabled).'
 
-      - name: Create RDP User with Secure Password
-        run: |
-          Add-Type -AssemblyName System.Security
-          $charSet = @{
-              Upper   = [char[]](65..90)      # A-Z
-              Lower   = [char[]](97..122)     # a-z
-              Number  = [char[]](48..57)      # 0-9
-              Special = ([char[]](33..47) + [char[]](58..64) +
-                         [char[]](91..96) + [char[]](123..126)) # Special characters
-          }
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 4
-          $rawPassword += $charSet.Lower | Get-Random -Count 4
-          $rawPassword += $charSet.Number | Get-Random -Count 4
-          $rawPassword += $charSet.Special | Get-Random -Count 4
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-          
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
-          
-          if (-not (Get-LocalUser -Name "RDP")) {
-              Write-Error "User creation failed"
-              exit 1
-          }
+      - name: Connect Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          hostname: gh-rdp-${{ github.run_id }}
+          version: latest
 
-      - name: Install Tailscale
+      - name: Restrict RDP to Tailscale and prepare shortcut
+        id: connection
+        env:
+          LITE_MODE: ${{ inputs.lite_mode }}
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-          
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
+          $ErrorActionPreference = 'Stop'
+          $tsIP = @(& tailscale ip -4 | Where-Object { $_ -match '^100\.' } | Select-Object -First 1)
+          if (-not $tsIP -or -not $tsIP[0]) {
+            throw 'No Tailscale IPv4 address was assigned.'
+          }
+          $ip = [string]$tsIP[0]
 
-      - name: Establish Tailscale Connection
-        run: |
-          # Bring up Tailscale with the provided auth key and set a unique hostname
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-          
-          # Wait for Tailscale to assign an IP
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
-              $retries++
-          }
-          
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
-              exit 1
-          }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-      
-      - name: Verify RDP Accessibility
-        run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          
-          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
-              exit 1
-          }
-          Write-Host "TCP connectivity successful!"
+          # Allow RDP only on the Tailscale IP, from Tailscale peers.
+          Get-NetFirewallRule -DisplayName 'RDP-Tailscale-Only' -ErrorAction SilentlyContinue |
+            Remove-NetFirewallRule -ErrorAction SilentlyContinue
+          New-NetFirewallRule -DisplayName 'RDP-Tailscale-Only' -Direction Inbound `
+            -Action Allow -Protocol TCP -LocalPort 3389 -LocalAddress $ip `
+            -RemoteAddress '100.64.0.0/10' -Profile Any | Out-Null
 
-      - name: Maintain Connection
-        run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
-          Write-Host "==================`n"
-          
-          # Keep runner active indefinitely (or until manually cancelled)
-          while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
-              Start-Sleep -Seconds 300
-          }
+          $lite = $env:LITE_MODE -eq 'true'
+          $width = if ($lite) { 1280 } else { 1600 }
+          $height = if ($lite) { 720 } else { 900 }
+          $bpp = if ($lite) { 16 } else { 32 }
+          $off = if ($lite) { 1 } else { 0 }
 
+          # RDP connection file contains no password.
+          $settings = @(
+            "full address:s:$ip"
+            'username:s:RDP'
+            'prompt for credentials on client:i:1'
+            'authentication level:i:2'
+            'enablecredsspsupport:i:1'
+            "desktopwidth:i:$width"
+            "desktopheight:i:$height"
+            "session bpp:i:$bpp"
+            "disable wallpaper:i:$off"
+            "disable full window drag:i:$off"
+            "disable menu anims:i:$off"
+            "disable themes:i:$off"
+            "allow font smoothing:i:$([int](-not $lite))"
+            'redirectprinters:i:0'
+            'redirectclipboard:i:1'
+            'audiomode:i:2'
+            'autoreconnection enabled:i:1'
+          )
+          $rdpFile = Join-Path $env:RUNNER_TEMP 'Connect-RDP.rdp'
+          $settings | Set-Content -Path $rdpFile -Encoding Unicode
+          "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+          Write-Host "RDP address: $ip"
+          Write-Host 'RDP username: RDP'
+          Write-Host 'Use the password stored in GitHub secret RDP_PASSWORD.'
+          Write-Host 'Download the Connect-RDP artifact and open its .rdp file.'
+
+          $listener = Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
+          if (-not $listener) {
+            throw 'RDP is not listening on TCP port 3389.'
+          }
+          Write-Host 'RDP listener is active.'
+          "### RDP connection`n- IP: ``$ip```n- User: ``RDP```n- Password: use your RDP_PASSWORD GitHub secret`n- Tailscale must be connected on your own PC." >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload one-click RDP file
+        uses: actions/upload-artifact@v4
+        with:
+          name: Connect-RDP-${{ github.run_id }}
+          path: ${{ runner.temp }}/Connect-RDP.rdp
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Keep RDP available for selected duration
+        env:
+          SESSION_MINUTES: ${{ inputs.session_minutes }}
+        run: |
+          $minutes = [int]$env:SESSION_MINUTES
+          if ($minutes -notin @(60, 120, 180, 300)) {
+            throw 'Invalid session duration.'
+          }
+          Write-Host "RDP is active at $env:TAILSCALE_IP for up to $minutes minutes."
+          Write-Host 'Cancel the workflow to stop it early.'
+          $end = (Get-Date).AddMinutes($minutes)
+          while ((Get-Date) -lt $end) {
+            Start-Sleep -Seconds 30
+          }
+          Write-Host 'RDP session completed.'
